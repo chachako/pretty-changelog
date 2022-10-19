@@ -129,6 +129,16 @@ impl Repository {
 			.map(|(a, b)| (a.id().to_string(), b))
 			.collect())
 	}
+
+	pub fn remote_urls(&self) -> Result<Vec<String>> {
+		let mut urls = Vec::new();
+		for remote in self.inner.remotes()?.iter().filter_map(|r| r) {
+			if let Some(url) = self.inner.find_remote(remote)?.url() {
+				urls.push(url.to_string());
+			}
+		}
+		Ok(urls)
+	}
 }
 
 #[cfg(test)]

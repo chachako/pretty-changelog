@@ -50,7 +50,7 @@ fn check_new_version() {
 }
 
 /// Runs `git-cliff`.
-pub fn run(mut args: Opt) -> Result<()> {
+pub async fn run(mut args: Opt) -> Result<()> {
 	// Check if there is a new version available.
 	#[cfg(feature = "update-informer")]
 	check_new_version();
@@ -271,21 +271,22 @@ pub fn run(mut args: Opt) -> Result<()> {
 	}
 
 	// Set the previous release if needed.
-	if args.latest || args.unreleased {
-		if let Some((commit_id, version)) =
-			tags.len().checked_sub(2).and_then(|v| tags.get_index(v))
-		{
-			let previous_release = Release {
-				commit_id: Some(commit_id.to_string()),
-				version: Some(version.to_string()),
-				..Release::default()
-			};
-			releases[0].previous = Some(Box::new(previous_release));
-		}
+	if let Some((commit_id, version)) = tags.len().checked_sub(2).and_then(|v| tags.get_index(v)) {
+		let previous_release = Release {
+			commit_id: Some(commit_id.to_string()),
+			version: Some(version.to_string()),
+			..Release::default()
+		};
+		releases[0].previous = Some(Box::new(previous_release));
 	}
 
 	// Generate changelog.
-	let changelog = Changelog::new(releases, &config)?;
+	let changelog = Changelog::new(
+		releases,
+		&config,
+		repository.remote_urls().ok(),
+		args.github_token.clone(),
+	).await?;
 	if let Some(path) = args.prepend {
 		changelog.prepend(fs::read_to_string(&path)?, &mut File::create(path)?)
 	} else if let Some(path) = args.output {

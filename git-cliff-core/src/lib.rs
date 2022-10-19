@@ -22,6 +22,8 @@ pub mod release;
 pub mod repo;
 /// Template engine.
 pub mod template;
+/// Github utils.
+pub mod github;
 
 /// Default configuration file.
 pub const DEFAULT_CONFIG: &str = "cliff.toml";

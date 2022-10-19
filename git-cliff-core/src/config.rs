@@ -20,6 +20,9 @@ pub struct Config {
 	/// Configuration values about git.
 	#[serde(default)]
 	pub git:       GitConfig,
+	/// Configuration values about github.
+	#[serde(default)]
+	pub github:    GithubConfig,
 }
 
 /// Changelog configuration.
@@ -35,7 +38,7 @@ pub struct ChangelogConfig {
 	pub trim:   Option<bool>,
 }
 
-/// Git configuration
+/// Git configuration.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitConfig {
 	/// Whether to enable parsing conventional commits.
@@ -71,6 +74,19 @@ pub struct GitConfig {
 	pub sort_commits:             Option<String>,
 	/// Limit the number of commits included in the changelog.
 	pub limit_commits:            Option<usize>,
+}
+
+/// Github configuration.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GithubConfig {
+	/// Github repository name with owner. For example, torvalds/linux.
+	pub repository:      Option<String>,
+	/// Whether to try to resolve the Github informations associated with the
+	/// authors of the commits.
+	pub resolve_authors: Option<bool>,
+	/// Whether to try to resolve the Github pull request links associated with
+	/// the commits.
+	pub resolve_prs:     Option<bool>,
 }
 
 /// Parser for grouping commits.

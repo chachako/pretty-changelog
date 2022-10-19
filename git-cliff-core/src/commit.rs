@@ -1,10 +1,6 @@
-use crate::command;
-use crate::config::{
-	CommitParser,
-	CommitPreprocessor,
-	GitConfig,
-	LinkParser,
-};
+use std::collections::HashMap;
+use crate::{command, github};
+use crate::config::{CommitParser, CommitPreprocessor, GitConfig, GithubConfig, LinkParser};
 use crate::error::{
 	Error as AppError,
 	Result,
@@ -52,7 +48,7 @@ struct Footer<'a> {
 	token:     &'a str,
 	/// The separator between the footer token and its value.
 	///
-	/// This is typically either `:` or `#`.
+	/// This is typically either `: ` or ` #`.
 	separator: &'a str,
 	/// The value of the footer.
 	value:     &'a str,
@@ -77,9 +73,9 @@ impl<'a> From<&'a ConventionalFooter<'a>> for Footer<'a> {
 )]
 pub struct Signature {
 	/// Name on the signature.
-	name:      Option<String>,
+	name:            Option<String>,
 	/// Email on the signature.
-	email:     Option<String>,
+	email:           Option<String>,
 	/// Time of the signature.
 	timestamp: i64,
 }
@@ -99,25 +95,33 @@ impl<'a> From<CommitSignature<'a>> for Signature {
 #[serde(rename_all = "camelCase")]
 pub struct Commit<'a> {
 	/// Commit ID.
-	pub id:            String,
+	pub id:               String,
 	/// Commit message including title, description and summary.
-	pub message:       String,
+	pub message:          String,
 	/// Conventional commit.
 	#[serde(skip_deserializing)]
-	pub conv:          Option<ConventionalCommit<'a>>,
+	pub conv:             Option<ConventionalCommit<'a>>,
 	/// Commit group based on a commit parser or its conventional type.
-	pub group:         Option<String>,
+	pub group:            Option<String>,
 	/// Default commit scope based on (inherited from) conventional type or a
 	/// commit parser.
-	pub default_scope: Option<String>,
+	pub default_scope:    Option<String>,
 	/// Commit scope for overriding the default one.
-	pub scope:         Option<String>,
+	pub scope:            Option<String>,
 	/// A list of links found in the commit
-	pub links:         Vec<Link>,
+	pub links:            Vec<Link>,
 	/// Commit author.
-	pub author:        Signature,
+	pub author:           Signature,
+	/// Commit coauthors.
+	pub coauthors:        Vec<Signature>,
 	/// Committer.
-	pub committer:     Signature,
+	pub committer:        Signature,
+	/// Github username of commit author.
+	pub github_author:    Option<String>,
+	/// Github usernames of commit coauthors.
+	pub github_coauthors: Option<Vec<String>>,
+	/// Associated pull request numbers.
+	pub pull_requests:    Option<Vec<u32>>,
 }
 
 impl<'a> From<String> for Commit<'a> {
@@ -144,9 +148,28 @@ impl<'a> From<String> for Commit<'a> {
 
 impl<'a> From<&GitCommit<'a>> for Commit<'a> {
 	fn from(commit: &GitCommit<'a>) -> Self {
+		let mut coauthors = Vec::new();
+		let message = commit.message().unwrap_or_default().to_string();
+		Regex::new(r#"(?mi)^Co-authored-by:\s*(?P<name>.+)(<(?P<email>.+)>)"#)
+			.unwrap()
+			.captures_iter(&message)
+			.for_each(|captures| {
+				if let (Some(name), Some(email)) = (
+					captures.name("name").map(|v| v.as_str()),
+					captures.name("email").map(|v| v.as_str()),
+				) {
+					coauthors.push(Signature {
+						name: Some(name.to_string()),
+						email: Some(email.to_string()),
+						timestamp: commit.author().when().seconds(),
+						..Default::default()
+					});
+				}
+			});
 		Commit {
+			message,
+			coauthors,
 			id: commit.id().to_string(),
-			message: commit.message().unwrap_or_default().to_string(),
 			author: commit.author().into(),
 			committer: commit.committer().into(),
 			..Default::default()
@@ -329,6 +352,112 @@ impl Commit<'_> {
 			.iter()
 			.flat_map(|conv| conv.footers().iter().map(Footer::from))
 	}
+
+	/// Resolves the Github information of this commit.
+	pub async fn resolve_github(
+		&mut self,
+		config: &GithubConfig,
+		token: &Option<String>,
+		github_repo: &str,
+		github_usernames: &mut HashMap<String, String>,
+		github_coauthors: &mut HashMap<Vec<(String, String)>, Vec<String>>,
+	) -> Result<()> {
+		if config.resolve_authors.is_some() {
+			if let Some(email) = &self.author.email {
+				if let Some(author) = github_usernames.get(email) {
+					self.github_author = Some(author.to_string());
+				} else {
+					let author = github::get_commit_author(token, github_repo, &self.id).await?;
+					self.github_author = Some(author.clone());
+					// Cache github username
+					github_usernames.insert(email.to_string(), author);
+				}
+			}
+		}
+
+		// Resolving PRs
+		self.pull_requests = Regex::new(r"(?m)\s\(#(\d+)\)$")
+			.unwrap()
+			.captures(&self.message)
+			.and_then(|c| c.get(1))
+			.map(|c| vec![c.as_str().parse::<u32>().unwrap()]);
+
+		if !self.coauthors.is_empty() {
+			let result = self.coauthors.iter()
+				.flat_map(|c| c.email.as_ref())
+				.flat_map(|e| github_usernames.get(e))
+				.cloned()
+				.collect::<Vec<_>>();
+
+			if result.len() == self.coauthors.len() {
+				self.github_coauthors = Some(result);
+			} else {
+				// This means that we need to get coauthors from PR
+				if self.pull_requests.is_none() {
+					self.pull_requests = Some(
+						github::get_prs_associated_with_commit(
+							token,
+							github_repo,
+							&self.id
+						).await?
+					);
+				}
+
+				let key = self.coauthors.iter()
+					.filter(|c| c.name.is_some() && c.email.is_some())
+					.map(|c| (c.name.clone().unwrap(), c.email.clone().unwrap()))
+					.collect::<Vec<_>>();
+
+				let coauthors = github_coauthors.get(&key);
+				if coauthors.is_none() {
+					if let Some(prs) = &self.pull_requests {
+						let mut res = Vec::new();
+						for pr in prs.iter() {
+							res.extend(
+								github::get_pr_authors(
+									token,
+									github_repo,
+									pr
+								).await?
+							)
+						}
+						github_coauthors.insert(key, res.clone());
+						self.github_coauthors = Some(res);
+					}
+				} else {
+					self.github_coauthors = coauthors.cloned();
+				};
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn authors(&self) -> Vec<String> {
+		let mut authors = Vec::new();
+		if let Some(github_author) = &self.github_author {
+			authors.push(github_author.to_string());
+		}
+		if let Some(github_coauthors) = &self.github_coauthors {
+			authors.extend(github_coauthors.iter().cloned());
+		}
+		authors
+	}
+
+	pub fn github_authors(&self) -> Vec<String> {
+		let mut authors = Vec::new();
+		if let Some(author) = &self.github_author {
+			authors.push(author.to_string());
+		}
+		if let Some(coauthors) = &self.github_coauthors {
+			authors.extend(coauthors.iter().map(|c| c.to_string()));
+		}
+		authors
+	}
+
+	pub fn pull_requests(&self) -> Vec<u32> {
+		self.pull_requests.clone().unwrap_or_default()
+	}
 }
 
 impl Serialize for Commit<'_> {
@@ -388,7 +517,9 @@ impl Serialize for Commit<'_> {
 		}
 		commit.serialize_field("links", &self.links)?;
 		commit.serialize_field("author", &self.author)?;
+		commit.serialize_field("coauthors", &self.coauthors)?;
 		commit.serialize_field("committer", &self.committer)?;
+		commit.serialize_field("pull_requests", &self.pull_requests)?;
 		commit.serialize_field("conventional", &self.conv.is_some())?;
 		commit.end()
 	}
@@ -450,7 +581,7 @@ mod test {
 				),
 				vec![Footer {
 					token:     "Signed-off-by",
-					separator: ":",
+					separator: ": ",
 					value:     "Test User <test@example.com>",
 					breaking:  false,
 				}],
@@ -466,13 +597,13 @@ mod test {
 				vec![
 					Footer {
 						token:     "BREAKING CHANGE",
-						separator: ":",
+						separator: ": ",
 						value:     "This commit breaks stuff",
 						breaking:  true,
 					},
 					Footer {
 						token:     "Signed-off-by",
-						separator: ":",
+						separator: ": ",
 						value:     "Test User <test@example.com>",
 						breaking:  false,
 					},

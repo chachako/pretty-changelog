@@ -50,6 +50,12 @@ pub enum Error {
 	/// Errors that may occur during parsing or compiling a regular expression.
 	#[error("Cannot parse/compile regex: `{0}`")]
 	RegexError(#[from] regex::Error),
+	#[error("Fmt error: `{0}`")]
+	FmtError(#[from] std::fmt::Error),
+	#[error("Reqwest error: `{0}`")]
+	ReqwestError(#[from] reqwest::Error),
+	#[error("Tokio join error: `{0}`")]
+	JoinError(#[from] tokio::task::JoinError),
 }
 
 /// Result type of the core library.

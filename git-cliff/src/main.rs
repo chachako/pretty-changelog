@@ -3,7 +3,8 @@ use git_cliff::args::Opt;
 use std::env;
 use std::process;
 
-fn main() {
+#[tokio::main]
+async fn main() {
 	let args = Opt::parse();
 	if args.verbose == 1 {
 		env::set_var("RUST_LOG", "debug");
@@ -13,7 +14,7 @@ fn main() {
 		env::set_var("RUST_LOG", "info");
 	}
 	pretty_env_logger::init();
-	match git_cliff::run(args) {
+	match git_cliff::run(args).await {
 		Ok(_) => process::exit(0),
 		Err(e) => {
 			log::error!("{}", e);

@@ -122,6 +122,13 @@ pub struct Opt {
 		default_value_t = Sort::Oldest
 	)]
 	pub sort:         Sort,
+	/// Token used when resolving informations related to Github.
+	#[clap(
+		long,
+		env = "GIT_CLIFF_GITHUB_TOKEN",
+		value_name = "TOKEN"
+	)]
+	pub github_token: Option<String>,
 	/// Sets the commit range to process.
 	#[clap(value_name = "RANGE", help_heading = Some("ARGS"))]
 	pub range:        Option<String>,

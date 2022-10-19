@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use git_cliff_core::commit::Commit;
 use git_cliff_core::config::Config;
 use git_cliff_core::error::Result;
@@ -6,48 +7,82 @@ use git_cliff_core::release::{
 	Releases,
 };
 use git_cliff_core::template::Template;
+use git_cliff_core::regex::Regex;
 use std::io::Write;
 
 /// Changelog generator.
 #[derive(Debug)]
 pub struct Changelog<'a> {
-	releases: Vec<Release<'a>>,
-	template: Template,
-	config:   &'a Config,
+	releases:     Vec<Release<'a>>,
+	template:     Option<Template>,
+	config:       &'a Config,
+	github_token: Option<String>,
+	github_repo:  Option<String>,
 }
 
 impl<'a> Changelog<'a> {
 	/// Constructs a new instance.
-	pub fn new(releases: Vec<Release<'a>>, config: &'a Config) -> Result<Self> {
+	pub async fn new(
+		releases: Vec<Release<'a>>,
+		config: &'a Config,
+		git_remotes: Option<Vec<String>>,
+		github_token: Option<String>,
+	) -> Result<Changelog> {
 		let mut template = config
 			.changelog
 			.body
-			.as_deref()
-			.unwrap_or_default()
-			.to_string();
+			.clone();
 		if config.changelog.trim.unwrap_or(true) {
-			template = template
-				.lines()
-				.map(|v| v.trim())
-				.collect::<Vec<&str>>()
-				.join("\n")
+			template = template.map(|t|
+				t.lines()
+					.map(|v| v.trim())
+					.collect::<Vec<&str>>()
+					.join("\n")
+			)
 		}
+		let github_repo = config.github.repository.clone().or_else(|| {
+			if let Some(git_remotes) = &git_remotes {
+				let github_url_regex = Regex::new(
+					r"github\.com[/:]([\w._-]+?)/([\w._-]+?)(\.git)?$"
+				).unwrap();
+				git_remotes.iter().find_map(|remote| {
+					github_url_regex.captures(remote).map(|captures| format!(
+						"{}/{}",
+						captures.get(1).unwrap().as_str().to_string(),
+						captures.get(2).unwrap().as_str().to_string(),
+					))
+				})
+			} else {
+				None
+			}
+		});
 		let mut changelog = Self {
+			template: if let Some(template) = template {
+				Some(Template::new(template)?)
+			} else {
+				None
+			},
 			releases,
-			template: Template::new(template)?,
 			config,
+			github_token,
+			github_repo
 		};
-		changelog.process_commits();
+		changelog.process_commits().await?;
 		changelog.process_releases();
 		Ok(changelog)
 	}
 
 	/// Processes the commits and omits the ones that doesn't match the
 	/// criteria set by configuration file.
-	fn process_commits(&mut self) {
+	async fn process_commits(&mut self) -> Result<()> {
 		debug!("Processing the commits...");
-		self.releases.iter_mut().for_each(|release| {
-			release.commits = release
+
+		let mut github_usernames = HashMap::new();
+		let mut github_coauthors = HashMap::new();
+
+		for release in self.releases.iter_mut() {
+			let mut result = Vec::new();
+			let commits = release
 				.commits
 				.iter()
 				.cloned()
@@ -79,7 +114,32 @@ impl<'a> Changelog<'a> {
 					}
 				})
 				.collect::<Vec<Commit>>();
-		});
+
+			// Concurrently process all commits
+			if self.config.github.resolve_prs.unwrap_or(true)
+				|| self.config.github.resolve_authors.unwrap_or(true) {
+				for commit in &commits {
+					let mut commit = commit.clone();
+
+					// Resolve the id of the commit author on Github
+					commit.resolve_github(
+						&self.config.github,
+						&self.github_token,
+						&self.github_repo.clone().expect("'repository' value is needed to resolve Github informations"),
+						&mut github_usernames,
+						&mut github_coauthors,
+					).await.expect("Failed to resolve Github informations");
+
+					result.push(commit);
+				}
+			} else {
+				result = commits.clone().to_vec();
+			}
+
+			release.commits = result;
+		};
+
+		Ok(())
 	}
 
 	/// Processes the releases and filters them out based on the configuration.
@@ -142,7 +202,11 @@ impl<'a> Changelog<'a> {
 			write!(out, "{}", header)?;
 		}
 		for release in &self.releases {
-			write!(out, "{}", self.template.render(release)?)?;
+			if let Some(template) = &self.template {
+				write!(out, "{}", template.render(release)?)?;
+			} else {
+				write!(out, "{}", Template::render_default(release, self.github_repo.clone())?)?;
+			}
 		}
 		if let Some(footer) = &self.config.changelog.footer {
 			write!(out, "{}", footer)?;
@@ -267,6 +331,7 @@ mod test {
 				link_parsers:             None,
 				limit_commits:            None,
 			},
+			..Default::default()
 		};
 		let test_release = Release {
 			version:   Some(String::from("v1.0.0")),
@@ -355,10 +420,10 @@ mod test {
 		(config, releases)
 	}
 
-	#[test]
-	fn changelog_generator() -> Result<()> {
+	#[tokio::test]
+	async fn changelog_generator() -> Result<()> {
 		let (config, releases) = get_test_data();
-		let changelog = Changelog::new(releases, &config)?;
+		let changelog = Changelog::new(releases, &config, None, None).await?;
 		let mut out = Vec::new();
 		changelog.generate(&mut out)?;
 		assert_eq!(
@@ -418,8 +483,8 @@ mod test {
 		Ok(())
 	}
 
-	#[test]
-	fn changelog_generator_split_commits() -> Result<()> {
+	#[tokio::test]
+	async fn changelog_generator_split_commits() -> Result<()> {
 		let (mut config, mut releases) = get_test_data();
 		config.git.split_commits = Some(true);
 		config.git.filter_unconventional = Some(false);
@@ -451,7 +516,7 @@ chore(deps): fix broken deps
 ",
 			),
 		));
-		let changelog = Changelog::new(releases, &config)?;
+		let changelog = Changelog::new(releases, &config, None, None).await?;
 		let mut out = Vec::new();
 		changelog.generate(&mut out)?;
 		assert_eq!(
